@@ -1,0 +1,33 @@
+# Historia del Prototipo
+
+Este paquete esta pensado para ayudarte a entender la evolucion del sistema por etapas.
+
+Importante:
+
+- `01_json_unity_proto` es una fase real conservada en disco.
+- `04_estado_actual_delta` es el estado actual real del proyecto.
+- `02_cluster_binario_base` y `03_juego_minimo_distribuido` son cortes didacticos montados a partir de los archivos actuales para que la lectura sea progresiva.
+- Como no habia repositorio git con commits historicos, esto no es un historial exacto de cada paso intermedio, sino una reconstruccion util para aprender.
+
+Orden recomendado de lectura:
+
+1. `01_json_unity_proto`
+2. `02_cluster_binario_base`
+3. `03_juego_minimo_distribuido`
+4. `04_estado_actual_delta`
+5. `05_balanceo_adaptativo`
+
+Que mirar en cada fase:
+
+- Fase 1: idea general y primer reparto de trabajo desde Unity.
+- Fase 2: salto a protocolo binario, snapshots, checksums y tolerancia a fallos.
+- Fase 3: convertir la simulacion en un juego minimo de supervivencia.
+- Fase 4: optimizacion de trafico con resultados delta y herramientas de benchmark.
+- Fase 5: balanceo adaptativo de zonas segun carga estimada.
+
+Consejo practico:
+
+- compara primero los nombres de clases y responsabilidades
+- luego mira como cambian los mensajes de red
+- despues mira como crece `ClusterSimulationManager`
+- deja la optimizacion delta y el balanceo adaptativo para el final
