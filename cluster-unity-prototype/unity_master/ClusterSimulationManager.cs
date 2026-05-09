@@ -72,6 +72,40 @@ public class ClusterSimulationManager : MonoBehaviour
         public bool requiresFullSnapshot;
         public string lastSnapshotWorkerName;
         public HashSet<int> lastSnapshotEntityIds = new HashSet<int>();
+        public List<MasterZoneHistoryEntry> masterHistory = new List<MasterZoneHistoryEntry>();
+    }
+
+    private enum MasterZoneHistoryReason : byte
+    {
+        RoundStart = 1,
+        SnapshotFullSent = 2,
+        SnapshotPatchSent = 3,
+        DistributedResult = 4,
+        LocalFallback = 5,
+    }
+
+    private sealed class MasterZoneEntitySnapshot
+    {
+        public int id;
+        public Vector2 position;
+        public Vector2 velocity;
+        public float speed;
+        public ClusterEntityStateCode stateCode;
+        public byte flags;
+    }
+
+    private sealed class MasterZoneHistoryEntry
+    {
+        public int tick;
+        public uint snapshotId;
+        public uint checksum;
+        public string ownerWorkerName;
+        public MasterZoneHistoryReason reason;
+        public int entityCount;
+        public int removedCount;
+        public int upsertCount;
+        public float recordedAtTime;
+        public List<MasterZoneEntitySnapshot> entities = new List<MasterZoneEntitySnapshot>();
     }
 
     private sealed class PendingZoneJob
@@ -100,6 +134,11 @@ public class ClusterSimulationManager : MonoBehaviour
     [SerializeField] [Range(0f, 1f)] private float ownerStickiness = 0.12f;
     [SerializeField] private float emptyZoneCost = 0.25f;
     [SerializeField] private bool allowSnapshotPatches = true;
+
+    [Header("Rollback Prep")]
+    [SerializeField] private bool enableMasterZoneHistory = true;
+    [SerializeField] private int masterZoneHistoryLimit = 8;
+    [SerializeField] private bool storeMasterEntitySnapshots = true;
 
     [Header("Simulation")]
     [SerializeField] private int enemyCount = 500;
@@ -487,6 +526,16 @@ public class ClusterSimulationManager : MonoBehaviour
                     ApplyError(worker, (ClusterErrorMessage)workerEvent.Message);
                     continue;
                 }
+
+                if (workerEvent.Message is ClusterZoneHistoryResponseMessage)
+                {
+                    ClusterZoneHistoryResponseMessage historyResponse = (ClusterZoneHistoryResponseMessage)workerEvent.Message;
+                    if (verboseConnectionLogging)
+                    {
+                        Debug.Log(string.Format("[ClusterNet] Received zone history response. worker={0} zone={1} entries={2}", worker.DisplayName, historyResponse.ZoneId, historyResponse.Entries.Count));
+                    }
+                    continue;
+                }
             }
         }
     }
@@ -549,6 +598,7 @@ public class ClusterSimulationManager : MonoBehaviour
                         {
                             zone.checksum = patch.Checksum;
                             patchSnapshotFramesSent++;
+                            RecordMasterZoneHistory(zone, entityIds, MasterZoneHistoryReason.SnapshotPatchSent, patch.RemovedEntityIds.Count, patch.UpsertEntities.Count);
                         }
                     }
 
@@ -560,6 +610,7 @@ public class ClusterSimulationManager : MonoBehaviour
                         {
                             zone.checksum = snapshot.Checksum;
                             fullSnapshotFramesSent++;
+                            RecordMasterZoneHistory(zone, entityIds, MasterZoneHistoryReason.SnapshotFullSent);
                         }
                     }
 
@@ -674,6 +725,7 @@ public class ClusterSimulationManager : MonoBehaviour
 
                 zone.lastTick = result.Tick;
                 zone.checksum = result.Checksum;
+                RecordMasterZoneHistory(zone, job.entityIds, MasterZoneHistoryReason.DistributedResult);
             }
 
             if (pendingJobs.Count == 0)
@@ -869,7 +921,86 @@ public class ClusterSimulationManager : MonoBehaviour
 
             zone.lastTick = targetTick;
             zone.checksum = ComputeZoneChecksum(zone, entityIds, targetTick);
+            RecordMasterZoneHistory(zone, entityIds, MasterZoneHistoryReason.LocalFallback);
         }
+    }
+
+    // Keep a short authoritative snapshot trail per zone so future rollback work has real state to build on.
+    private void RecordMasterZoneHistory(ZoneRuntime zone, List<int> entityIds, MasterZoneHistoryReason reason, int removedCount = 0, int upsertCount = 0)
+    {
+        if (!enableMasterZoneHistory)
+        {
+            return;
+        }
+
+        MasterZoneHistoryEntry entry = new MasterZoneHistoryEntry();
+        entry.tick = zone.lastTick;
+        entry.snapshotId = zone.snapshotId;
+        entry.checksum = zone.checksum;
+        entry.ownerWorkerName = zone.ownerWorkerName;
+        entry.reason = reason;
+        entry.entityCount = entityIds != null ? entityIds.Count : 0;
+        entry.removedCount = removedCount;
+        entry.upsertCount = upsertCount;
+        entry.recordedAtTime = Time.unscaledTime;
+
+        if (storeMasterEntitySnapshots && entityIds != null)
+        {
+            for (int index = 0; index < entityIds.Count; index++)
+            {
+                EntityRuntime entity;
+                if (!entities.TryGetValue(entityIds[index], out entity))
+                {
+                    continue;
+                }
+
+                MasterZoneEntitySnapshot snapshot = new MasterZoneEntitySnapshot();
+                snapshot.id = entity.id;
+                snapshot.position = entity.currentPosition;
+                snapshot.velocity = entity.velocity;
+                snapshot.speed = entity.speed;
+                snapshot.stateCode = entity.stateCode;
+                snapshot.flags = entity.flags;
+                entry.entities.Add(snapshot);
+            }
+        }
+
+        zone.masterHistory.Add(entry);
+        int limit = Mathf.Max(1, masterZoneHistoryLimit);
+        while (zone.masterHistory.Count > limit)
+        {
+            zone.masterHistory.RemoveAt(0);
+        }
+    }
+
+    private int GetMasterHistoryEntryCount()
+    {
+        int total = 0;
+
+        foreach (KeyValuePair<int, ZoneRuntime> pair in zones)
+        {
+            total += pair.Value.masterHistory.Count;
+        }
+
+        return total;
+    }
+
+    private int GetMasterHistorySnapshotCount()
+    {
+        int total = 0;
+
+        foreach (KeyValuePair<int, ZoneRuntime> pair in zones)
+        {
+            for (int index = 0; index < pair.Value.masterHistory.Count; index++)
+            {
+                if (pair.Value.masterHistory[index].entities.Count > 0)
+                {
+                    total++;
+                }
+            }
+        }
+
+        return total;
     }
 
     private ClusterZoneSnapshotFrame BuildZoneSnapshot(ZoneRuntime zone, List<int> entityIds)
@@ -1425,6 +1556,16 @@ public class ClusterSimulationManager : MonoBehaviour
             pair.Value.requiresFullSnapshot = true;
             pair.Value.lastSnapshotWorkerName = string.Empty;
             pair.Value.lastSnapshotEntityIds.Clear();
+            pair.Value.masterHistory.Clear();
+        }
+
+        Dictionary<int, List<int>> memberships = BuildZoneMemberships();
+        for (int zoneId = 0; zoneId < zones.Count; zoneId++)
+        {
+            ZoneRuntime zone = zones[zoneId];
+            zone.lastTick = 0;
+            zone.checksum = ComputeZoneChecksum(zone, memberships[zoneId], 0);
+            RecordMasterZoneHistory(zone, memberships[zoneId], MasterZoneHistoryReason.RoundStart);
         }
     }
 
@@ -1482,6 +1623,7 @@ public class ClusterSimulationManager : MonoBehaviour
         GUILayout.Label(string.Format("RX Rate: {0:0.0} B/s", overlayNetworkRateReceived));
         GUILayout.Label(string.Format("Result Frames: full={0} delta={1}", fullResultFrames, deltaResultFrames));
         GUILayout.Label(string.Format("Snapshot Frames: full={0} patch={1}", fullSnapshotFramesSent, patchSnapshotFramesSent));
+        GUILayout.Label(string.Format("Master History: entries={0} snapshots={1}", GetMasterHistoryEntryCount(), GetMasterHistorySnapshotCount()));
         GUILayout.Label(string.Format("Balancing: {0}", adaptiveZoneAssignment ? "adaptive" : "round-robin"));
 
         for (int index = 0; index < workers.Count; index++)

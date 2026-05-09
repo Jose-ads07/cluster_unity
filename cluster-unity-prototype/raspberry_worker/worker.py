@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import gzip
+import json
 import math
+import os
 import random
 import socket
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from protocol import (
@@ -18,6 +22,8 @@ from protocol import (
     ObjectiveType,
     ResultStatus,
     SimulateDeltaResult,
+    ZoneHistoryEntry,
+    ZoneHistoryReason,
     ZoneSnapshot,
     SimulateResult,
     compute_zone_checksum,
@@ -25,11 +31,13 @@ from protocol import (
     decode_simulate,
     decode_snapshot,
     decode_snapshot_patch,
+    decode_zone_history_request,
     encode_error,
     encode_heartbeat,
     encode_result,
     encode_result_delta,
     encode_stats_response,
+    encode_zone_history_response,
     encode_welcome,
     quantize_milli,
     read_frame,
@@ -71,6 +79,7 @@ class ZoneState:
     aux_y: float
     checksum: int
     entities: list = field(default_factory=list)
+    history: deque = field(default_factory=deque)
 
 
 class ProtocolError(Exception):
@@ -82,7 +91,7 @@ class ProtocolError(Exception):
 
 
 class ClusterWorkerServer:
-    def __init__(self, host, port, label, heartbeat_ms, max_zones, max_entities_per_zone, delay_ms, jitter_ms, drop_rate, report_interval):
+    def __init__(self, host, port, label, heartbeat_ms, max_zones, max_entities_per_zone, delay_ms, jitter_ms, drop_rate, report_interval, zone_history_limit, history_export_path, history_export_mode, history_export_max_bytes, history_export_max_files, history_export_compress_rotated):
         self.host = host
         self.port = port
         self.label = label
@@ -93,11 +102,22 @@ class ClusterWorkerServer:
         self.jitter_ms = jitter_ms
         self.drop_rate = drop_rate
         self.report_interval = report_interval
+        self.zone_history_limit = max(1, int(zone_history_limit))
+        self.history_export_path = history_export_path or ""
+        self.history_export_mode = history_export_mode
+        self.history_export_max_bytes = max(0, int(history_export_max_bytes))
+        self.history_export_max_files = max(1, int(history_export_max_files))
+        self.history_export_compress_rotated = history_export_compress_rotated
         self.started_at = time.perf_counter()
         self.session_counter = 1
         self.lock = threading.Lock()
+        self.export_lock = threading.Lock()
         self.stats = WorkerStats()
         self.running = True
+        self.history_export_file = None
+
+        if self.history_export_path:
+            self._open_history_export_file()
 
     def _next_session_id(self):
         with self.lock:
@@ -127,7 +147,10 @@ class ClusterWorkerServer:
                 f"simulations={stats.total_simulations} "
                 f"errors={stats.total_errors} "
                 f"avg_us={stats.average_processing_us} "
-                f"max_us={stats.max_processing_us}"
+                f"max_us={stats.max_processing_us} "
+                f"history_limit={self.zone_history_limit} "
+                f"history_export={'on' if self.history_export_file is not None else 'off'} "
+                f"history_rotation_bytes={self.history_export_max_bytes}"
             )
 
     def _maybe_delay(self):
@@ -175,6 +198,125 @@ class ClusterWorkerServer:
         desired_y = ((ny * 0.45 * direction_scale) + wander_y * 0.55) * entity.speed
         return desired_x, desired_y, int(EntityStateCode.WANDER)
 
+    def _record_zone_history(self, zone, reason, removed_count=0, upsert_count=0):
+        if zone.history.maxlen != self.zone_history_limit:
+            zone.history = deque(zone.history, maxlen=self.zone_history_limit)
+
+        entry = ZoneHistoryEntry(
+            snapshot_id=zone.snapshot_id,
+            tick=zone.tick,
+            checksum=zone.checksum,
+            entity_count=len(zone.entities),
+            reason=int(reason),
+            removed_count=int(removed_count),
+            upsert_count=int(upsert_count),
+            recorded_at_ms=int((time.perf_counter() - self.started_at) * 1000.0),
+        )
+        zone.history.append(entry)
+        self._export_zone_history(zone, entry)
+
+    def _export_zone_history(self, zone, entry):
+        if self.history_export_file is None:
+            return
+
+        payload = {
+            "worker_label": self.label,
+            "zone_id": int(zone.zone_id),
+            "snapshot_id": int(entry.snapshot_id),
+            "tick": int(entry.tick),
+            "checksum": int(entry.checksum),
+            "entity_count": int(entry.entity_count),
+            "reason": int(entry.reason),
+            "reason_name": ZoneHistoryReason(int(entry.reason)).name,
+            "removed_count": int(entry.removed_count),
+            "upsert_count": int(entry.upsert_count),
+            "recorded_at_ms": int(entry.recorded_at_ms),
+            "grid_x": int(zone.grid_x),
+            "grid_y": int(zone.grid_y),
+            "objective_type": int(zone.objective_type),
+            "target_x": float(zone.target_x),
+            "target_y": float(zone.target_y),
+            "aux_x": float(zone.aux_x),
+            "aux_y": float(zone.aux_y),
+        }
+
+        if self.history_export_mode == "full":
+            payload["entities"] = [
+                {
+                    "id": int(entity.entity_id),
+                    "x": float(entity.x),
+                    "y": float(entity.y),
+                    "vx": float(entity.vx),
+                    "vy": float(entity.vy),
+                    "speed": float(entity.speed),
+                    "state": int(entity.state),
+                    "flags": int(entity.flags),
+                }
+                for entity in zone.entities
+            ]
+
+        line = json.dumps(payload, separators=(",", ":"))
+        with self.export_lock:
+            self._rotate_history_export_if_needed(len(line.encode("utf-8")) + 1)
+            self.history_export_file.write(line + "\n")
+
+    def _open_history_export_file(self):
+        export_dir = os.path.dirname(self.history_export_path)
+        if export_dir:
+            os.makedirs(export_dir, exist_ok=True)
+        self.history_export_file = open(self.history_export_path, "a", encoding="utf-8", buffering=1)
+
+    def _close_history_export_file(self):
+        if self.history_export_file is not None:
+            self.history_export_file.close()
+            self.history_export_file = None
+
+    def _rotation_plain_path(self, index):
+        return f"{self.history_export_path}.{index}"
+
+    def _rotation_gzip_path(self, index):
+        return f"{self.history_export_path}.{index}.gz"
+
+    def _rotate_history_export_if_needed(self, incoming_bytes):
+        if self.history_export_file is None or self.history_export_max_bytes <= 0:
+            return
+
+        self.history_export_file.flush()
+        current_size = self.history_export_file.tell()
+        if current_size <= 0:
+            return
+
+        if current_size + incoming_bytes <= self.history_export_max_bytes:
+            return
+
+        self._rotate_history_export_file()
+
+    def _rotate_history_export_file(self):
+        self._close_history_export_file()
+
+        for path in (self._rotation_plain_path(self.history_export_max_files), self._rotation_gzip_path(self.history_export_max_files)):
+            if os.path.exists(path):
+                os.remove(path)
+
+        for index in range(self.history_export_max_files - 1, 0, -1):
+            src_gzip = self._rotation_gzip_path(index)
+            src_plain = self._rotation_plain_path(index)
+            if os.path.exists(src_gzip):
+                os.replace(src_gzip, self._rotation_gzip_path(index + 1))
+            elif os.path.exists(src_plain):
+                os.replace(src_plain, self._rotation_plain_path(index + 1))
+
+        if os.path.exists(self.history_export_path):
+            if self.history_export_compress_rotated:
+                rotated_path = self._rotation_gzip_path(1)
+                with open(self.history_export_path, "rb") as source, gzip.open(rotated_path, "wb") as target:
+                    target.write(source.read())
+                os.remove(self.history_export_path)
+            else:
+                os.replace(self.history_export_path, self._rotation_plain_path(1))
+
+        self._open_history_export_file()
+
     def _simulate_zone(self, zone, request):
         started_at = time.perf_counter()
         previous_entities = list(zone.entities)
@@ -219,6 +361,7 @@ class ClusterWorkerServer:
         zone.entities = next_entities
         zone.tick = request.tick
         zone.checksum = compute_zone_checksum(zone.zone_id, zone.tick, zone.entities)
+        self._record_zone_history(zone, ZoneHistoryReason.SIMULATE)
 
         processing_us = int((time.perf_counter() - started_at) * 1_000_000.0)
         with self.lock:
@@ -330,7 +473,9 @@ class ClusterWorkerServer:
                         aux_y=snapshot.aux_y,
                         checksum=snapshot.checksum,
                         entities=list(snapshot.entities),
+                        history=deque(maxlen=self.zone_history_limit),
                     )
+                    self._record_zone_history(zones[snapshot.zone_id], ZoneHistoryReason.SNAPSHOT_FULL)
                     with self.lock:
                         self.stats.total_snapshots += 1
                     last_tick = max(last_tick, snapshot.tick)
@@ -372,6 +517,7 @@ class ClusterWorkerServer:
                     zone.aux_y = patch.aux_y
                     zone.entities = list(entity_map.values())
                     zone.checksum = compute_zone_checksum(zone.zone_id, zone.tick, zone.entities)
+                    self._record_zone_history(zone, ZoneHistoryReason.SNAPSHOT_PATCH, removed_count=len(patch.removed_entity_ids), upsert_count=len(patch.upsert_entities))
                     with self.lock:
                         self.stats.total_snapshots += 1
                     last_tick = max(last_tick, zone.tick)
@@ -427,6 +573,21 @@ class ClusterWorkerServer:
                     send_frame(conn, MessageType.STATS_RESPONSE, payload)
                     continue
 
+                if message_type == MessageType.ZONE_HISTORY_REQUEST:
+                    request = decode_zone_history_request(payload)
+                    zone = zones.get(request.zone_id)
+                    if zone is None:
+                        raise ProtocolError(ErrorCode.UNKNOWN_ZONE, 0, f"zone {request.zone_id} not known for history request")
+
+                    history_entries = list(zone.history)
+                    max_entries = max(0, int(request.max_entries))
+                    if max_entries > 0:
+                        history_entries = history_entries[-max_entries:]
+
+                    response = encode_zone_history_response(zone.zone_id, history_entries)
+                    send_frame(conn, MessageType.ZONE_HISTORY_RESPONSE, response)
+                    continue
+
                 raise ProtocolError(ErrorCode.INVALID_MESSAGE, 0, f"unsupported message type {int(message_type)}")
         except EOFError:
             pass
@@ -472,6 +633,7 @@ class ClusterWorkerServer:
                 thread.start()
         finally:
             self.running = False
+            self._close_history_export_file()
             sock.close()
 
 
@@ -487,6 +649,12 @@ def main():
     parser.add_argument("--jitter-ms", type=float, default=0.0)
     parser.add_argument("--drop-rate", type=float, default=0.0)
     parser.add_argument("--report-interval", type=float, default=10.0)
+    parser.add_argument("--zone-history-limit", type=int, default=16)
+    parser.add_argument("--history-export-path", default="")
+    parser.add_argument("--history-export-mode", choices=["metadata", "full"], default="metadata")
+    parser.add_argument("--history-export-max-bytes", type=int, default=0)
+    parser.add_argument("--history-export-max-files", type=int, default=4)
+    parser.add_argument("--history-export-compress-rotated", action="store_true")
     args = parser.parse_args()
 
     server = ClusterWorkerServer(
@@ -500,6 +668,12 @@ def main():
         jitter_ms=args.jitter_ms,
         drop_rate=args.drop_rate,
         report_interval=args.report_interval,
+        zone_history_limit=args.zone_history_limit,
+        history_export_path=args.history_export_path,
+        history_export_mode=args.history_export_mode,
+        history_export_max_bytes=args.history_export_max_bytes,
+        history_export_max_files=args.history_export_max_files,
+        history_export_compress_rotated=args.history_export_compress_rotated,
     )
     server.serve()
 

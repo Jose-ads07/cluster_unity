@@ -22,6 +22,12 @@ Parámetros importantes:
 - `--drop-rate`: porcentaje de respuestas descartadas para probar timeouts
 - `--max-entities-per-zone`: guardarrail para evitar snapshots absurdos
 - `--report-interval`: cada cuantos segundos imprime stats internas
+- `--zone-history-limit`: cuantos hitos recientes guarda por zona para diagnostico
+- `--history-export-path`: fichero JSONL al que se exporta el historial por zona
+- `--history-export-mode`: `metadata` o `full`, segun quieras solo metadatos o tambien entidades
+- `--history-export-max-bytes`: tamano maximo del fichero activo antes de rotar
+- `--history-export-max-files`: cuantas rotaciones conservar
+- `--history-export-compress-rotated`: comprime las rotaciones antiguas como `.gz`
 
 ## Prueba de carga
 
@@ -54,6 +60,42 @@ Prueba con fallos:
 
 ```bash
 python3 tools/load_test.py --spawn-local-workers --workers 4 --grid-columns 4 --grid-rows 4 --entities-per-zone 128 --ticks 120 --worker-delay-ms 8 --worker-jitter-ms 4 --worker-drop-rate 0.02
+```
+
+Smoke test especifico de snapshot patch:
+
+```bash
+python3 tools/snapshot_patch_smoke.py --spawn-local-worker
+```
+
+Consulta de historial por zona:
+
+```bash
+python3 tools/zone_history_query.py --host 127.0.0.1 --port 7000 --zone-id 0 --limit 8
+```
+
+Smoke test especifico de historial:
+
+```bash
+python3 tools/zone_history_smoke.py --spawn-local-worker
+```
+
+Smoke test especifico del export:
+
+```bash
+python3 tools/zone_history_export_smoke.py --export-path /tmp/cluster-history-export.jsonl
+```
+
+Smoke test de rotacion y compresion:
+
+```bash
+python3 tools/zone_history_rotation_smoke.py
+```
+
+Inspeccion o verificacion offline del export:
+
+```bash
+python3 tools/zone_history_replay.py --input /tmp/cluster-history-export.jsonl --zone-id 0 --tail 8 --verify-checksums
 ```
 
 ## Bateria comparativa recomendada
@@ -126,19 +168,24 @@ Marcadores principales:
 Qué buscar:
 
 - mucho tiempo en `SnapshotSerialize`: demasiadas resincronizaciones
+- demasiados `Snapshot Frames: full` frente a `patch`: se esta perdiendo la base o cambiando demasiado el owner
 - demasiadas resincronizaciones tras rebalances: `ownerStickiness` demasiado bajo
 - mucho tiempo en `LocalFallback`: workers lentos o inestables
 - mucho tiempo en `ApplyResult`: demasiadas entidades por zona o frecuencia demasiado alta
 - poco tiempo en red pero mucho en render: el cuello no está en el cluster sino en Unity
+- demasiadas entradas `SNAPSHOT_FULL` en el historial de una zona: el patch no esta aportando tanto como deberia
 
 ## Recomendaciones operativas
 
 - mantener `requestTimeoutSeconds` por encima del `p99` real del cluster
 - empezar con pocas zonas y subir gradualmente
 - si las Raspberry son lentas, bajar `entities-per-zone` o aumentar workers
-- si hay mucha migración entre zonas, considerar zonas más grandes o deltas de estado
+- si hay mucha migración entre zonas, considerar zonas más grandes o vigilar la relacion entre `Snapshot Frames: patch` y `full`
 - usar red cableada en vez de Wi-Fi para reducir jitter
 - si el balanceador cambia owners demasiado a menudo, subir `ownerStickiness` o `rebalanceIntervalSeconds`
+- si quieres mas contexto de una zona concreta, consultar su historial antes de tocar timeouts o scheduler
+- si activas export `full`, reservarlo para sesiones de diagnostico porque el fichero crece rapido
+- si activas rotacion, el replay puede leer la base y sus rotaciones `.N` o `.N.gz`
 
 ## Incidencias típicas
 
@@ -149,7 +196,13 @@ Qué buscar:
 `SNAPSHOT_MISMATCH`:
 
 - el worker y el maestro no están usando el mismo `snapshotId`
-- suele resolverse con reenvío de snapshot
+- si el owner es el mismo, primero merece la pena revisar por qué no bastó el patch
+- suele resolverse con reenvío de snapshot completo
+
+`ZONE_HISTORY_REQUEST` sobre zona desconocida:
+
+- el worker aun no ha recibido snapshot valido para esa zona
+- o la zona estuvo en otro worker distinto
 
 `TICK_OUT_OF_ORDER`:
 
@@ -171,9 +224,13 @@ Corre en Unity:
 - autoridad del estado de partida
 - deteccion de derrota
 - conexion y coordinacion de workers
+- historial autoritativo reciente por zona
 
 Corre en workers:
 
 - simulacion de enemigos por zona
 - reaccion de enemigos frente al jugador
 - heartbeat y stats de procesamiento
+- historial acotado por zona para diagnostico
+- export opcional del historial a JSONL
+- rotacion y compresion opcional del export

@@ -199,6 +199,11 @@ public sealed class ClusterWorkerClient : IDisposable
         return SendRaw(ClusterMessageType.StatsRequest, ClusterBinaryProtocol.BuildStatsRequest());
     }
 
+    public bool RequestZoneHistory(int zoneId, ushort maxEntries)
+    {
+        return SendRaw(ClusterMessageType.ZoneHistoryRequest, ClusterBinaryProtocol.BuildZoneHistoryRequest(zoneId, maxEntries));
+    }
+
     private bool SendRaw(ClusterMessageType messageType, byte[] payload)
     {
         if (stream == null)

@@ -28,6 +28,8 @@ class MessageType(IntEnum):
     STATS_RESPONSE = 9
     RESULT_DELTA = 10
     SNAPSHOT_PATCH = 11
+    ZONE_HISTORY_REQUEST = 12
+    ZONE_HISTORY_RESPONSE = 13
 
 
 class ObjectiveType(IntEnum):
@@ -192,6 +194,36 @@ class StatsResponseFrame:
     average_processing_us: int
     max_processing_us: int
     known_zones: int
+
+
+class ZoneHistoryReason(IntEnum):
+    SNAPSHOT_FULL = 1
+    SNAPSHOT_PATCH = 2
+    SIMULATE = 3
+
+
+@dataclass
+class ZoneHistoryRequest:
+    zone_id: int
+    max_entries: int
+
+
+@dataclass
+class ZoneHistoryEntry:
+    snapshot_id: int
+    tick: int
+    checksum: int
+    entity_count: int
+    reason: int
+    removed_count: int = 0
+    upsert_count: int = 0
+    recorded_at_ms: int = 0
+
+
+@dataclass
+class ZoneHistoryResponse:
+    zone_id: int
+    entries: List[ZoneHistoryEntry] = field(default_factory=list)
 
 
 def clamp(value, minimum, maximum):
@@ -667,6 +699,18 @@ def encode_stats_request():
     return b""
 
 
+def encode_zone_history_request(zone_id, max_entries=16):
+    return struct.pack("<iH", int(zone_id), int(max_entries))
+
+
+def decode_zone_history_request(payload):
+    if len(payload) != struct.calcsize("<iH"):
+        raise ValueError("invalid zone history request payload")
+
+    zone_id, max_entries = struct.unpack("<iH", payload)
+    return ZoneHistoryRequest(zone_id=zone_id, max_entries=max_entries)
+
+
 def encode_stats_response(total_messages, total_snapshots, total_simulations, total_errors, average_processing_us, max_processing_us, known_zones):
     return struct.pack(
         "<QQQQIII",
@@ -694,3 +738,58 @@ def decode_stats_response(payload):
         max_processing_us=values[5],
         known_zones=values[6],
     )
+
+
+def encode_zone_history_response(zone_id, entries):
+    buffer = bytearray()
+    buffer.extend(struct.pack("<iH", int(zone_id), len(entries)))
+
+    for entry in entries:
+        buffer.extend(
+            struct.pack(
+                "<IiIHBxHHI",
+                int(entry.snapshot_id),
+                int(entry.tick),
+                int(entry.checksum),
+                int(entry.entity_count),
+                int(entry.reason),
+                int(entry.removed_count),
+                int(entry.upsert_count),
+                int(entry.recorded_at_ms),
+            )
+        )
+
+    return bytes(buffer)
+
+
+def decode_zone_history_response(payload):
+    minimum = struct.calcsize("<iH")
+    if len(payload) < minimum:
+        raise ValueError("invalid zone history response payload")
+
+    zone_id, entry_count = struct.unpack_from("<iH", payload, 0)
+    offset = minimum
+    entry_size = struct.calcsize("<IiIHBxHHI")
+    entries = []
+
+    for _ in range(entry_count):
+        end = offset + entry_size
+        if end > len(payload):
+            raise ValueError("zone history response truncated")
+
+        values = struct.unpack_from("<IiIHBxHHI", payload, offset)
+        entries.append(
+            ZoneHistoryEntry(
+                snapshot_id=values[0],
+                tick=values[1],
+                checksum=values[2],
+                entity_count=values[3],
+                reason=values[4],
+                removed_count=values[5],
+                upsert_count=values[6],
+                recorded_at_ms=values[7],
+            )
+        )
+        offset = end
+
+    return ZoneHistoryResponse(zone_id=zone_id, entries=entries)

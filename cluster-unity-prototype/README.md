@@ -30,6 +30,11 @@ Hay dos niveles de implementacion:
   - `worker.py`: worker stateful con snapshots, simulate, heartbeat y stats.
 - `tools/`
   - `load_test.py`: prueba de carga y throughput del protocolo binario.
+  - `zone_history_query.py`: consulta el historial reciente de una zona en un worker.
+  - `zone_history_smoke.py`: smoke test del historial por zona.
+  - `zone_history_replay.py`: inspecciona o verifica offline un export de historial.
+  - `zone_history_export_smoke.py`: smoke test del export persistente de historial.
+  - `zone_history_rotation_smoke.py`: smoke test de rotacion y compresion del export.
 - `docs/`
   - `ARCHITECTURE.md`
   - `PROTOCOL.md`
@@ -50,6 +55,11 @@ Hay dos niveles de implementacion:
 - reconexion y reenvio de snapshots al volver un nodo
 - soporte correcto para `localhost`, DNS e IPs literales como `127.0.0.1` o `192.168.1.50`
 - resultados binarios delta por entidad para reducir el trafico del worker al maestro
+- snapshot patches por zona para resincronizaciones parciales cuando el owner se mantiene
+- historial reciente por zona en los workers para diagnostico y futura base de replay
+- historial autoritativo reciente por zona tambien en el maestro para preparar rollback real
+- export opcional del historial por zona a JSONL para inspeccion o verificacion offline
+- rotacion y compresion del export para sesiones largas
 - marcadores de profiling para Unity Profiler
 - script de carga para medir latencia, throughput y robustez
 - bateria automatizada para comparar `100`, `500` y `5000` enemigos con grid `2x2` y `4x4`
@@ -68,6 +78,8 @@ Opciones utiles:
 ```bash
 python3 worker.py --host 0.0.0.0 --port 7001 --label pi-b --delay-ms 5 --jitter-ms 2
 python3 worker.py --host 0.0.0.0 --port 7002 --label pi-c --drop-rate 0.02
+python3 worker.py --host 0.0.0.0 --port 7003 --label pi-d --history-export-path /tmp/pi-d-history.jsonl --history-export-mode full
+python3 worker.py --host 0.0.0.0 --port 7004 --label pi-e --history-export-path /tmp/pi-e-history.jsonl --history-export-mode full --history-export-max-bytes 1048576 --history-export-max-files 4 --history-export-compress-rotated
 ```
 
 ### 2. Escena en Unity
@@ -135,6 +147,10 @@ python3 tools/benchmark_matrix.py --spawn-local-workers --workers 2 --base-port 
 - `adaptiveZoneAssignment`: activa balanceo adaptativo en vez de round-robin fijo.
 - `rebalanceIntervalSeconds`: cada cuanto se permite recalcular owners.
 - `ownerStickiness`: cuanto se favorece mantener el owner actual para evitar resnapshots constantes.
+- `allowSnapshotPatches`: permite resincronizar una zona con patch parcial si sigue en el mismo worker.
+- `enableMasterZoneHistory`: guarda historial reciente por zona en el maestro.
+- `masterZoneHistoryLimit`: cuantos snapshots/hitos recientes conserva cada zona en Unity.
+- `storeMasterEntitySnapshots`: si el historial del maestro guarda tambien estado completo de entidades.
 
 ## Documentacion tecnica
 
@@ -145,14 +161,75 @@ python3 tools/benchmark_matrix.py --spawn-local-workers --workers 2 --base-port 
 ## Limitaciones actuales
 
 - El maestro sigue siendo autoritativo y unico punto de render.
-- Los snapshots de resincronizacion siguen siendo completos; el ahorro fuerte esta en los resultados delta.
-- No hay persistencia ni replay de snapshots en disco.
+- Los snapshot patches solo cubren resincronizaciones en el mismo owner; si cambia el worker o hay desync duro, se vuelve a snapshot completo.
+- El historial por zona sigue siendo acotado en memoria; el export a disco es opcional y esta pensado para diagnostico o replay offline, no para rollback en caliente.
+- El maestro ya conserva base para rollback, pero aun no existe una operacion de rewind segura expuesta al gameplay.
 - La validacion de checksum detecta corrupcion o desincronizacion, pero no resuelve rollback.
 - La IA sigue siendo deliberadamente simple para priorizar la prueba del paralelismo distribuido.
 
 ## Siguientes pasos naturales
 
-- snapshots historicos y rollback si luego quieres lockstep o multiplayer
+- rollback real por ticks en el maestro usando el historial autoritativo ya guardado
+- export o compactacion incremental mas eficiente si quieres capturas todavia mas largas
+- compresion o rotacion del export de historial si quieres capturas largas sin ficheros enormes
 - IA mas rica por zona o migracion a ECS/DOTS si el lado Unity crece
-- snapshots parciales de resincronizacion para no reenviar toda la zona
 - metricas historicas por zona para hacer balanceo adaptativo aun mas fino
+
+## Smoke test rapido de snapshot patch
+
+```bash
+cd cluster-unity-prototype
+python3 tools/snapshot_patch_smoke.py --spawn-local-worker
+```
+
+Este test comprueba que:
+
+- un worker acepta `SNAPSHOT`
+- luego acepta `SNAPSHOT_PATCH`
+- y el siguiente `SIMULATE` refleja altas y bajas de entidades sin reenviar la zona completa
+
+## Consulta rapida del historial por zona
+
+```bash
+cd cluster-unity-prototype
+python3 tools/zone_history_query.py --host 127.0.0.1 --port 7000 --zone-id 0 --limit 8
+```
+
+Smoke test del historial:
+
+```bash
+python3 tools/zone_history_smoke.py --spawn-local-worker
+```
+
+Este flujo comprueba que el worker recuerda los ultimos hitos de una zona:
+
+- `SNAPSHOT_FULL`
+- `SIMULATE`
+- `SNAPSHOT_PATCH`
+- `SIMULATE`
+
+## Export y replay offline del historial
+
+Arrancar un worker exportando historial:
+
+```bash
+python3 raspberry_worker/worker.py --host 0.0.0.0 --port 7000 --label pi-a --history-export-path /tmp/pi-a-history.jsonl --history-export-mode full
+```
+
+Inspeccionar el fichero exportado:
+
+```bash
+python3 tools/zone_history_replay.py --input /tmp/pi-a-history.jsonl --zone-id 0 --tail 8 --verify-checksums
+```
+
+Smoke test del export:
+
+```bash
+python3 tools/zone_history_export_smoke.py --export-path /tmp/cluster-history-export.jsonl
+```
+
+Smoke test de rotacion y compresion:
+
+```bash
+python3 tools/zone_history_rotation_smoke.py
+```

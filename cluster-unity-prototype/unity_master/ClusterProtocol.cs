@@ -17,6 +17,8 @@ public enum ClusterMessageType : ushort
     StatsResponse = 9,
     ResultDelta = 10,
     SnapshotPatch = 11,
+    ZoneHistoryRequest = 12,
+    ZoneHistoryResponse = 13,
 }
 
 public enum ClusterObjectiveType : byte
@@ -49,6 +51,13 @@ public enum ClusterResultStatus : byte
 {
     Ok = 0,
     ResnapshotRequired = 1,
+}
+
+public enum ClusterZoneHistoryReason : byte
+{
+    SnapshotFull = 1,
+    SnapshotPatch = 2,
+    Simulate = 3,
 }
 
 public sealed class ClusterProtocolEntityState
@@ -178,6 +187,24 @@ public sealed class ClusterStatsResponseMessage : ClusterIncomingMessage
     public uint KnownZones;
 }
 
+public sealed class ClusterZoneHistoryEntry
+{
+    public uint SnapshotId;
+    public int Tick;
+    public uint Checksum;
+    public ushort EntityCount;
+    public ClusterZoneHistoryReason Reason;
+    public ushort RemovedCount;
+    public ushort UpsertCount;
+    public uint RecordedAtMs;
+}
+
+public sealed class ClusterZoneHistoryResponseMessage : ClusterIncomingMessage
+{
+    public int ZoneId;
+    public List<ClusterZoneHistoryEntry> Entries = new List<ClusterZoneHistoryEntry>();
+}
+
 public static class ClusterBinaryProtocol
 {
     private const uint Magic = 0x52434C55;
@@ -283,6 +310,17 @@ public static class ClusterBinaryProtocol
     public static byte[] BuildStatsRequest()
     {
         return Array.Empty<byte>();
+    }
+
+    public static byte[] BuildZoneHistoryRequest(int zoneId, ushort maxEntries)
+    {
+        using (MemoryStream stream = new MemoryStream())
+        using (BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8))
+        {
+            writer.Write(zoneId);
+            writer.Write(maxEntries);
+            return stream.ToArray();
+        }
     }
 
     public static int WriteFrame(Stream stream, ClusterMessageType messageType, byte[] payload)
@@ -452,6 +490,31 @@ public static class ClusterBinaryProtocol
                         message.AverageProcessingUs = reader.ReadUInt32();
                         message.MaxProcessingUs = reader.ReadUInt32();
                         message.KnownZones = reader.ReadUInt32();
+                        return message;
+                    }
+                case ClusterMessageType.ZoneHistoryResponse:
+                    {
+                        ClusterZoneHistoryResponseMessage message = new ClusterZoneHistoryResponseMessage();
+                        message.MessageType = messageType;
+                        message.FrameSizeBytes = frameSizeBytes;
+                        message.ZoneId = reader.ReadInt32();
+                        ushort entryCount = reader.ReadUInt16();
+
+                        for (int index = 0; index < entryCount; index++)
+                        {
+                            ClusterZoneHistoryEntry entry = new ClusterZoneHistoryEntry();
+                            entry.SnapshotId = reader.ReadUInt32();
+                            entry.Tick = reader.ReadInt32();
+                            entry.Checksum = reader.ReadUInt32();
+                            entry.EntityCount = reader.ReadUInt16();
+                            entry.Reason = (ClusterZoneHistoryReason)reader.ReadByte();
+                            reader.ReadByte();
+                            entry.RemovedCount = reader.ReadUInt16();
+                            entry.UpsertCount = reader.ReadUInt16();
+                            entry.RecordedAtMs = reader.ReadUInt32();
+                            message.Entries.Add(entry);
+                        }
+
                         return message;
                     }
                 default:

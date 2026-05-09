@@ -11,6 +11,7 @@ Separar render y coordinacion en Unity del calculo de simulacion distribuido en 
   - decide la asignacion espacial a zonas
   - gestiona conexiones, timeouts y fallback local
   - aplica reglas de partida, derrota, reinicio y score
+  - conserva historial reciente con snapshots autoritativos por zona para preparar rollback real
 - `ClusterPlayerController` en Unity:
   - recoge input local
   - mueve al jugador dentro de los limites del mundo
@@ -18,15 +19,23 @@ Separar render y coordinacion en Unity del calculo de simulacion distribuido en 
   - muestra estado de partida, puntuacion y estado del cluster
 - `ClusterWorkerClient`:
   - una conexion TCP por worker
-  - handshake, envio de snapshots y jobs de simulacion
+  - handshake, envio de snapshots completos, snapshot patches y jobs de simulacion
   - recepcion de resultados completos o delta, heartbeats y errores
 - `worker.py`:
   - mantiene el estado por zona que se le asigna
   - aplica snapshots completos cuando el maestro lo indica
+  - aplica snapshot patches cuando la zona sigue en el mismo owner
   - simula ticks de zonas y devuelve resultados
   - calcula la reaccion de enemigos frente a la posicion del jugador
+  - conserva un historial acotado por zona para diagnostico y futura base de replay
+  - puede exportar ese historial a JSONL para inspeccion offline
+  - soporta rotacion y compresion de ese export para sesiones largas
 - `load_test.py`:
   - emula al maestro para medir latencia, throughput y robustez
+- `zone_history_query.py`:
+  - consulta el historial reciente de una zona en un worker
+- `zone_history_replay.py`:
+  - inspecciona o verifica offline un export persistente del historial
 
 ## Modelo de autoridad
 
@@ -43,6 +52,7 @@ En la version actual eso significa:
 - Unity decide el estado de la partida y la posicion del jugador.
 - Los workers no toman decisiones de victoria, derrota o UI.
 - Los workers solo resuelven simulacion de enemigos por zona.
+- Unity tambien conserva la traza autoritativa reciente de cada zona.
 
 ## Modelo de particion
 
@@ -74,16 +84,37 @@ Cada zona tiene:
 - `tick`
 - `checksum`
 - `ownerWorkerName`
+- historial reciente acotado en el worker
 
 Flujo:
 
 1. Unity calcula que entidades pertenecen a una zona.
-2. Si cambia la pertenencia, el owner, el balanceador o el worker se ha reconectado, Unity manda un snapshot.
-3. Luego manda `Simulate` con `snapshotId`, `tick` y posicion del jugador.
-4. El worker responde con resultado para ese `snapshotId` y ese `tick`.
-5. Unity valida `zoneId`, `snapshotId`, `tick` y `checksum`.
+2. Si cambia la pertenencia y el owner se mantiene, Unity puede mandar un `SNAPSHOT_PATCH`.
+3. Si cambia el owner, el worker se ha reconectado o hubo desync duro, Unity manda `SNAPSHOT` completo.
+4. Luego manda `Simulate` con `snapshotId`, `tick` y posicion del jugador.
+5. El worker responde con resultado para ese `snapshotId` y ese `tick`.
+6. Unity valida `zoneId`, `snapshotId`, `tick` y `checksum`.
 
 Esto evita aplicar resultados viejos o desincronizados.
+
+El historial actual guarda hitos recientes de tipo:
+
+- `SNAPSHOT_FULL`
+- `SNAPSHOT_PATCH`
+- `SIMULATE`
+
+Por ahora sirve para inspeccion y preparacion de replay, no para rollback automatico.
+Si se activa export a disco, ese mismo historial tambien puede revisarse fuera del proceso.
+
+Del lado maestro, cada zona tambien conserva una ventana corta de snapshots/hitos autoritativos:
+
+- inicio de ronda
+- snapshot completo enviado
+- snapshot patch enviado
+- resultado distribuido aplicado
+- fallback local aplicado
+
+Eso prepara la base para un rollback real por tick sin depender solo del worker.
 
 ## Tolerancia a fallos
 
@@ -92,7 +123,7 @@ Si un job de una zona no vuelve antes del timeout:
 - el worker se marca como no confiable
 - la zona se marca como `snapshotDirty`
 - Unity simula esa zona localmente
-- al reconectar, el worker recibe snapshot nuevo
+- al reconectar, el worker recibe snapshot completo nuevo
 
 Decisiones:
 
@@ -109,12 +140,20 @@ Motivo:
 - fixed-size records por entidad simplifican parseo y reducen garbage
 - es facil medir bytes reales enviados y recibidos
 - los `RESULT_DELTA` reducen la carga de la ruta worker -> maestro sin cambiar la autoridad
+- los `SNAPSHOT_PATCH` reducen el coste de resincronizacion cuando una zona sigue en el mismo worker
+- el historial por zona permite inspeccionar la evolucion reciente de una zona sin tocar el loop principal
+- el export JSONL del historial permite revisar o verificar capturas reales tras una prueba larga
+- el historial del maestro ya guarda estado suficiente para que el siguiente paso sea rollback real y no solo diagnostico
 
 Tradeoff:
 
 - el protocolo es menos amigable para inspeccion manual
 - hay que mantener versionado y documentacion mas estrictos
 - la cuantizacion delta puede ahorrar trafico a costa de algo mas de CPU en serializacion
+- los patches no sustituyen al snapshot completo cuando cambia el owner o se pierde la base
+- el historial actual es en memoria y acotado, asi que no sustituye a persistencia ni replay offline
+- el export completo con entidades puede crecer rapido si capturas muchas zonas o sesiones largas
+- guardar snapshots en el maestro tiene coste de memoria, por eso la ventana es corta y configurable
 
 ## Errores
 
@@ -155,7 +194,7 @@ Se instrumenta en dos capas:
 
 ## Camino de evolucion recomendado
 
-1. snapshots parciales e historicos por zona
-2. rollback o validacion fuerte si se busca multijugador
+1. rollback real por tick en el maestro usando el historial ya guardado
+2. compactacion incremental o diffs en el export offline
 3. metricas mas finas por zona para mejorar aun mas el balanceo
 4. IA mas rica o migracion a ECS/DOTS si el lado Unity crece

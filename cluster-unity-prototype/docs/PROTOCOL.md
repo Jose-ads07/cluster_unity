@@ -24,6 +24,10 @@ Todos los frames usan este header en little-endian:
 - `7 ERROR`
 - `8 STATS_REQUEST`
 - `9 STATS_RESPONSE`
+- `10 RESULT_DELTA`
+- `11 SNAPSHOT_PATCH`
+- `12 ZONE_HISTORY_REQUEST`
+- `13 ZONE_HISTORY_RESPONSE`
 
 ## Record por entidad
 
@@ -93,6 +97,41 @@ Uso:
 - resincronizar una zona
 - enviar pertenencia nueva de entidades
 - enviar objetivo distinto o cambio de owner
+
+## SNAPSHOT_PATCH
+
+Campos:
+
+- `zoneId: int32`
+- `baseSnapshotId: uint32`
+- `snapshotId: uint32`
+- `tick: int32`
+- `gridX: uint16`
+- `gridY: uint16`
+- `objectiveType: uint8`
+- `padding: 3 bytes`
+- `targetX: float32`
+- `targetY: float32`
+- `auxX: float32`
+- `auxY: float32`
+- `checksum: uint32`
+- `removedCount: uint16`
+- `removedEntityIds[]: int32`
+- `upsertCount: uint16`
+- `upsertEntities[]`
+
+Uso:
+
+- resincronizar parcialmente una zona cuando sigue en el mismo worker
+- quitar entidades que ya no pertenecen a esa zona
+- insertar entidades nuevas sin reenviar el resto de la zona
+- actualizar metadatos de zona y checksum sobre la nueva composicion
+
+Semantica:
+
+- `baseSnapshotId` debe coincidir con el ultimo snapshot conocido por el worker
+- si no coincide, el worker responde con `SNAPSHOT_MISMATCH`
+- si cambia el owner o se pierde la base, el maestro vuelve a `SNAPSHOT` completo
 
 ## SIMULATE
 
@@ -211,6 +250,50 @@ Codigos actuales:
 - `maxProcessingUs: uint32`
 - `knownZones: uint32`
 
+## ZONE_HISTORY_REQUEST
+
+Campos:
+
+- `zoneId: int32`
+- `maxEntries: uint16`
+
+Uso:
+
+- pedir al worker el historial reciente de una zona
+- diagnosticar resincronizaciones, patches y simulaciones recientes
+
+## ZONE_HISTORY_RESPONSE
+
+Campos:
+
+- `zoneId: int32`
+- `entryCount: uint16`
+- `entries[]`
+
+Cada `entry` ocupa 24 bytes:
+
+- `snapshotId: uint32`
+- `tick: int32`
+- `checksum: uint32`
+- `entityCount: uint16`
+- `reason: uint8`
+- `padding: 1 byte`
+- `removedCount: uint16`
+- `upsertCount: uint16`
+- `recordedAtMs: uint32`
+
+Valores actuales de `reason`:
+
+- `1 SNAPSHOT_FULL`
+- `2 SNAPSHOT_PATCH`
+- `3 SIMULATE`
+
+Semantica:
+
+- el historial es acotado y vive en memoria del worker
+- `removedCount` y `upsertCount` ayudan a ver el coste de cada patch
+- `recordedAtMs` es tiempo relativo desde que arranco el worker
+
 ## Objetivos por zona
 
 - `0 SEEK`
@@ -224,3 +307,5 @@ Codigos actuales:
 - El checksum no sustituye a criptografia; aqui solo detecta corrupcion o desync accidental.
 - El gameplay vive en Unity, pero la decision de movimiento de enemigos se calcula en workers a partir del `SIMULATE`.
 - `RESULT_DELTA` reduce bytes en la ruta mas caliente sin cambiar el modelo autoritativo del maestro.
+- `SNAPSHOT_PATCH` reduce bytes en resincronizaciones parciales, pero no sustituye al snapshot completo en cambios de owner o recovery duro.
+- `ZONE_HISTORY_RESPONSE` expone metadatos de la evolucion reciente de una zona sin alterar el flujo normal de juego.
