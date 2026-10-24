@@ -1,0 +1,20 @@
+# Local OS, Python and editor files
+.DS_Store
+._*
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.env
+.env.*
+
+# Runtime diagnostics, never source snapshots
+*.log
+*.jsonl
+*.jsonl.gz
+/build/
+/dist/
+
+# Historical exports live in archive/exports; avoid new root duplicates
+/cluster-unity-prototype-history*.zip

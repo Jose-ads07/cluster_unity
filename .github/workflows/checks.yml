@@ -1,0 +1,38 @@
+name: Python protocol checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        working-directory: cluster-unity-prototype
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - name: Check current Python syntax without generating bytecode
+        run: python -c "import ast; from pathlib import Path; [ast.parse(p.read_text(), filename=str(p)) for p in Path('.').rglob('*.py')]"
+      - name: Zone history
+        run: python tools/zone_history_smoke.py --spawn-local-worker
+      - name: History export
+        run: python tools/zone_history_export_smoke.py
+      - name: History rotation
+        run: python tools/zone_history_rotation_smoke.py
+      - name: Small loopback load test
+        run: python tools/load_test.py --spawn-local-workers --workers 2 --grid-columns 2 --grid-rows 2 --entities-per-zone 8 --ticks 10

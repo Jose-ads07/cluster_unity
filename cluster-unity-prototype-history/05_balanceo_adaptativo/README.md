@@ -138,9 +138,9 @@ python3 tools/benchmark_matrix.py --spawn-local-workers --workers 2 --base-port 
 
 ## Documentacion tecnica
 
-- [Arquitectura](/Users/joseadsuara/Documents/Codex/cluster-unity-prototype/docs/ARCHITECTURE.md:1)
-- [Protocolo](/Users/joseadsuara/Documents/Codex/cluster-unity-prototype/docs/PROTOCOL.md:1)
-- [Operaciones y Carga](/Users/joseadsuara/Documents/Codex/cluster-unity-prototype/docs/OPERATIONS.md:1)
+- [Arquitectura](../../cluster-unity-prototype/docs/ARCHITECTURE.md)
+- [Protocolo](../../cluster-unity-prototype/docs/PROTOCOL.md)
+- [Operaciones y Carga](../../cluster-unity-prototype/docs/OPERATIONS.md)
 
 ## Limitaciones actuales
 
